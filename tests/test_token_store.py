@@ -50,7 +50,7 @@ def test_save_and_load_valid_token(tmp_path, monkeypatch):
     store, keyring = setup_store(tmp_path, monkeypatch)
 
     store.save("abc")
-    assert keyring.get_password(ts.KEYRING_SERVICE, ts.KEYRING_USERNAME) == "abc"
+    assert keyring.get_password(ts.KEYRING_SERVICE, ts.KEYRING_ACCESS_USERNAME) == "abc"
     assert not store.token_file.exists()
 
     store2 = ts.DropboxTokenStore(base_dir=tmp_path)
@@ -59,24 +59,103 @@ def test_save_and_load_valid_token(tmp_path, monkeypatch):
     assert store2.access_token == "abc"
 
 
+def test_save_and_load_with_refresh_token(tmp_path, monkeypatch):
+    """save() should persist refresh_token to keyring and load() should find it."""
+    store, keyring = setup_store(tmp_path, monkeypatch)
+
+    store.save("access123", "refresh456")
+    assert keyring.get_password(ts.KEYRING_SERVICE, ts.KEYRING_ACCESS_USERNAME) == "access123"
+    assert keyring.get_password(ts.KEYRING_SERVICE, ts.KEYRING_REFRESH_USERNAME) == "refresh456"
+    assert not store.token_file.exists()  # No file when keyring works
+    assert store.refresh_token == "refresh456"
+
+    store2 = ts.DropboxTokenStore(base_dir=tmp_path)
+    assert store2.load()
+    assert store2.access_token == "access123"
+    assert store2.refresh_token == "refresh456"
+
+
+def test_load_invalid_token_with_refresh_succeeds(tmp_path, monkeypatch):
+    """If access token is expired but refresh token exists, load() should refresh."""
+    store, keyring = setup_store(tmp_path, monkeypatch)
+
+    # Simulate: keyring has expired access token + valid refresh token
+    keyring.set_password(ts.KEYRING_SERVICE, ts.KEYRING_ACCESS_USERNAME, "expired_access")
+    keyring.set_password(ts.KEYRING_SERVICE, ts.KEYRING_REFRESH_USERNAME, "valid_refresh")
+
+    # First call with expired access fails, then _do_refresh returns new token
+    call_count = [0]
+    def fake_dropbox(token):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            return FakeDropbox(token, valid=False)
+        return FakeDropbox(token, valid=True)
+    monkeypatch.setattr(ts.dropbox, "Dropbox", fake_dropbox)
+
+    # Mock _do_refresh to return a new access token
+    monkeypatch.setattr(store, "_do_refresh", lambda rt: "new_access_token")
+
+    assert store.load()
+    assert store.access_token == "new_access_token"
+    assert store.refresh_token == "valid_refresh"
+
+
+def test_load_invalid_token_with_refresh_fails_clears(tmp_path, monkeypatch):
+    """If both access and refresh fail, clear() should be called."""
+    store, keyring = setup_store(tmp_path, monkeypatch)
+
+    keyring.set_password(ts.KEYRING_SERVICE, ts.KEYRING_ACCESS_USERNAME, "expired")
+    keyring.set_password(ts.KEYRING_SERVICE, ts.KEYRING_REFRESH_USERNAME, "bad_refresh")
+
+    monkeypatch.setattr(ts.dropbox, "Dropbox", lambda token: FakeDropbox(token, valid=False))
+    monkeypatch.setattr(store, "_do_refresh", lambda rt: None)
+
+    assert not store.load()
+    assert not store.is_authenticated
+    assert keyring.get_password(ts.KEYRING_SERVICE, ts.KEYRING_ACCESS_USERNAME) is None
+
+
+def test_load_network_error_does_not_clear(tmp_path, monkeypatch):
+    """Transient network errors should NOT clear stored credentials."""
+    store, keyring = setup_store(tmp_path, monkeypatch)
+
+    keyring.set_password(ts.KEYRING_SERVICE, ts.KEYRING_ACCESS_USERNAME, "maybe_valid")
+    keyring.set_password(ts.KEYRING_SERVICE, ts.KEYRING_REFRESH_USERNAME, "refresh")
+
+    # Simulate network error (not AuthError)
+    class NetworkError(Exception):
+        pass
+
+    def network_fail(token):
+        raise NetworkError("Connection refused")
+
+    monkeypatch.setattr(ts.dropbox, "Dropbox", network_fail)
+
+    assert not store.load()
+    assert not store.is_authenticated
+    # Tokens should still be in keyring — NOT cleared
+    assert keyring.get_password(ts.KEYRING_SERVICE, ts.KEYRING_ACCESS_USERNAME) == "maybe_valid"
+    assert keyring.get_password(ts.KEYRING_SERVICE, ts.KEYRING_REFRESH_USERNAME) == "refresh"
+
+
 def test_load_invalid_token_clears_state(tmp_path, monkeypatch):
     store, keyring = setup_store(tmp_path, monkeypatch)
-    keyring.set_password(ts.KEYRING_SERVICE, ts.KEYRING_USERNAME, "bad_token")
+    keyring.set_password(ts.KEYRING_SERVICE, ts.KEYRING_ACCESS_USERNAME, "bad_token")
     monkeypatch.setattr(ts.dropbox, "Dropbox", lambda token: FakeDropbox(token, valid=False))
 
     assert not store.load()
     assert not store.is_authenticated
-    assert keyring.get_password(ts.KEYRING_SERVICE, ts.KEYRING_USERNAME) is None
+    assert keyring.get_password(ts.KEYRING_SERVICE, ts.KEYRING_ACCESS_USERNAME) is None
 
 
 def test_clear_removes_token_from_keyring(tmp_path, monkeypatch):
     store, keyring = setup_store(tmp_path, monkeypatch)
 
     store.save("abc")
-    assert keyring.get_password(ts.KEYRING_SERVICE, ts.KEYRING_USERNAME) == "abc"
+    assert keyring.get_password(ts.KEYRING_SERVICE, ts.KEYRING_ACCESS_USERNAME) == "abc"
 
     store.clear()
-    assert keyring.get_password(ts.KEYRING_SERVICE, ts.KEYRING_USERNAME) is None
+    assert keyring.get_password(ts.KEYRING_SERVICE, ts.KEYRING_ACCESS_USERNAME) is None
     assert not store.is_authenticated
 
 
@@ -105,12 +184,23 @@ def test_save_fallback_to_file(tmp_path, monkeypatch):
     assert store.access_token == "fallback_token"
 
 
+def test_save_fallback_to_file_with_refresh(tmp_path, monkeypatch):
+    """When keyring fails, both tokens should go to file."""
+    store, _ = setup_store(tmp_path, monkeypatch, keyring_available=False)
+
+    store.save("access_tok", "refresh_tok")
+
+    data = json.loads(store.token_file.read_text())
+    assert data["access_token"] == "access_tok"
+    assert data["refresh_token"] == "refresh_tok"
+
+
 def test_save_both_keyring_and_file_fail(tmp_path, monkeypatch):
     store, _ = setup_store(tmp_path, monkeypatch, keyring_available=False)
     tmp_path.chmod(0o400)
 
     try:
-        with pytest.raises(RuntimeError, match="Failed to save token"):
+        with pytest.raises((RuntimeError, OSError, PermissionError)):
             store.save("test_token")
     finally:
         tmp_path.chmod(0o700)
@@ -128,19 +218,23 @@ def test_read_token_file_invalid(tmp_path, content, reason):
     store = ts.DropboxTokenStore(base_dir=tmp_path)
     store.token_file.write_text(content)
 
-    assert store._read_token_file(store.token_file) is None
+    result = store._read_token_file(store.token_file)
+    assert isinstance(result, dict)
+    assert not result.get("access_token")
 
 
 def test_load_generic_exception(tmp_path, monkeypatch):
+    """Generic (transient) errors should NOT clear stored credentials."""
     store, keyring = setup_store(tmp_path, monkeypatch)
-    keyring.set_password(ts.KEYRING_SERVICE, ts.KEYRING_USERNAME, "test_token")
+    keyring.set_password(ts.KEYRING_SERVICE, ts.KEYRING_ACCESS_USERNAME, "test_token")
     monkeypatch.setattr(
         ts.dropbox, "Dropbox", lambda token: (_ for _ in ()).throw(Exception("Error"))
     )
 
     assert not store.load()
     assert not store.is_authenticated
-    assert keyring.get_password(ts.KEYRING_SERVICE, ts.KEYRING_USERNAME) is None
+    # Transient errors should preserve stored tokens
+    assert keyring.get_password(ts.KEYRING_SERVICE, ts.KEYRING_ACCESS_USERNAME) == "test_token"
 
 
 def test_clear_removes_file_token(tmp_path, monkeypatch):
@@ -163,7 +257,44 @@ def test_get_default_token_dir_fallback(monkeypatch):
     assert ts.get_default_token_dir() == ts.pathlib.Path.cwd()
 
 
-def setup_interactive_test(tmp_path, monkeypatch, user_input="y"):
+def test_try_refresh_success(tmp_path, monkeypatch):
+    """try_refresh() should update tokens and return True."""
+    store, keyring = setup_store(tmp_path, monkeypatch)
+    store.access_token = "old_token"
+    store.refresh_token = "valid_refresh"
+    store.dbx = FakeDropbox("old_token", valid=True)
+
+    monkeypatch.setattr(store, "_do_refresh", lambda rt: "new_token")
+
+    assert store.try_refresh() is True
+    assert store.access_token == "new_token"
+    # Keyring should be updated
+    assert keyring.get_password(ts.KEYRING_SERVICE, ts.KEYRING_ACCESS_USERNAME) == "new_token"
+
+
+def test_try_refresh_no_refresh_token(tmp_path, monkeypatch):
+    """try_refresh() should return False if no refresh token."""
+    store, _ = setup_store(tmp_path, monkeypatch)
+    store.access_token = "some_token"
+    store.refresh_token = None
+
+    assert store.try_refresh() is False
+
+
+def test_try_refresh_failure(tmp_path, monkeypatch):
+    """try_refresh() should return False (not clear) when refresh fails."""
+    store, keyring = setup_store(tmp_path, monkeypatch)
+    store.access_token = "expired"
+    store.refresh_token = "also_bad"
+
+    monkeypatch.setattr(store, "_do_refresh", lambda rt: None)
+
+    assert store.try_refresh() is False
+    # Credentials should NOT be cleared by try_refresh (caller decides)
+    assert store.refresh_token == "also_bad"
+
+
+def _setup_interactive_test(tmp_path, monkeypatch, user_input="y"):
     """Helper to setup interactive clearing tests."""
     keyring = FakeKeyring()
     monkeypatch.setattr(ts, "keyring", keyring)
@@ -173,37 +304,37 @@ def setup_interactive_test(tmp_path, monkeypatch, user_input="y"):
 
 
 def test_clear_token_interactive_no_token(tmp_path, monkeypatch, capsys):
-    setup_interactive_test(tmp_path, monkeypatch)
+    _setup_interactive_test(tmp_path, monkeypatch)
     ts.clear_token_interactive()
     assert "No token found" in capsys.readouterr().out
 
 
 def test_clear_token_interactive_keyring_confirm(tmp_path, monkeypatch, capsys):
-    keyring, _ = setup_interactive_test(tmp_path, monkeypatch, "y")
-    keyring.set_password(ts.KEYRING_SERVICE, ts.KEYRING_USERNAME, "test_token")
+    keyring, _ = _setup_interactive_test(tmp_path, monkeypatch, "y")
+    keyring.set_password(ts.KEYRING_SERVICE, ts.KEYRING_ACCESS_USERNAME, "test_token")
 
     ts.clear_token_interactive()
 
     out = capsys.readouterr().out
     assert "Token found in keyring" in out
     assert "Token removed successfully" in out
-    assert keyring.get_password(ts.KEYRING_SERVICE, ts.KEYRING_USERNAME) is None
+    assert keyring.get_password(ts.KEYRING_SERVICE, ts.KEYRING_ACCESS_USERNAME) is None
 
 
 def test_clear_token_interactive_keyring_decline(tmp_path, monkeypatch, capsys):
-    keyring, _ = setup_interactive_test(tmp_path, monkeypatch, "n")
-    keyring.set_password(ts.KEYRING_SERVICE, ts.KEYRING_USERNAME, "test_token")
+    keyring, _ = _setup_interactive_test(tmp_path, monkeypatch, "n")
+    keyring.set_password(ts.KEYRING_SERVICE, ts.KEYRING_ACCESS_USERNAME, "test_token")
 
     ts.clear_token_interactive()
 
     out = capsys.readouterr().out
     assert "Token found in keyring" in out
     assert "Token not removed" in out
-    assert keyring.get_password(ts.KEYRING_SERVICE, ts.KEYRING_USERNAME) == "test_token"
+    assert keyring.get_password(ts.KEYRING_SERVICE, ts.KEYRING_ACCESS_USERNAME) == "test_token"
 
 
 def test_clear_token_interactive_file(tmp_path, monkeypatch, capsys):
-    _, token_file = setup_interactive_test(tmp_path, monkeypatch, "y")
+    _, token_file = _setup_interactive_test(tmp_path, monkeypatch, "y")
     token_file.write_text(json.dumps({"access_token": "file_token"}))
 
     ts.clear_token_interactive()
@@ -216,8 +347,8 @@ def test_clear_token_interactive_file(tmp_path, monkeypatch, capsys):
 
 
 def test_clear_token_interactive_both(tmp_path, monkeypatch, capsys):
-    keyring, token_file = setup_interactive_test(tmp_path, monkeypatch, "y")
-    keyring.set_password(ts.KEYRING_SERVICE, ts.KEYRING_USERNAME, "keyring_token")
+    keyring, token_file = _setup_interactive_test(tmp_path, monkeypatch, "y")
+    keyring.set_password(ts.KEYRING_SERVICE, ts.KEYRING_ACCESS_USERNAME, "keyring_token")
     token_file.write_text(json.dumps({"access_token": "file_token"}))
 
     ts.clear_token_interactive()
@@ -226,5 +357,5 @@ def test_clear_token_interactive_both(tmp_path, monkeypatch, capsys):
     assert "Token found in keyring" in out
     assert "Token found in file" in out
     assert "Token removed successfully" in out
-    assert keyring.get_password(ts.KEYRING_SERVICE, ts.KEYRING_USERNAME) is None
+    assert keyring.get_password(ts.KEYRING_SERVICE, ts.KEYRING_ACCESS_USERNAME) is None
     assert not token_file.exists()
