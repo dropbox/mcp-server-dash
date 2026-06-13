@@ -294,6 +294,70 @@ def test_try_refresh_failure(tmp_path, monkeypatch):
     assert store.refresh_token == "also_bad"
 
 
+def test_try_refresh_transient_error(tmp_path, monkeypatch):
+    """try_refresh() should return False (not raise) on transient errors."""
+    store, keyring = setup_store(tmp_path, monkeypatch)
+    store.access_token = "expired"
+    store.refresh_token = "valid_but_network_down"
+
+    def raise_transient(rt):
+        raise ts.TransientRefreshError("Connection refused")
+
+    monkeypatch.setattr(store, "_do_refresh", raise_transient)
+
+    assert store.try_refresh() is False
+    # Credentials preserved — not cleared
+    assert store.refresh_token == "valid_but_network_down"
+
+
+def test_load_refresh_transient_does_not_clear(tmp_path, monkeypatch):
+    """Transient network error during refresh must NOT clear stored credentials."""
+    store, keyring = setup_store(tmp_path, monkeypatch)
+
+    keyring.set_password(ts.KEYRING_SERVICE, ts.KEYRING_ACCESS_USERNAME, "expired_access")
+    keyring.set_password(ts.KEYRING_SERVICE, ts.KEYRING_REFRESH_USERNAME, "valid_refresh")
+
+    monkeypatch.setattr(ts.dropbox, "Dropbox", lambda token: FakeDropbox(token, valid=False))
+
+    def raise_transient(rt):
+        raise ts.TransientRefreshError("Server unreachable")
+
+    monkeypatch.setattr(store, "_do_refresh", raise_transient)
+
+    assert not store.load()
+    assert not store.is_authenticated
+    # Both tokens should still be in keyring — NOT cleared
+    assert keyring.get_password(ts.KEYRING_SERVICE, ts.KEYRING_ACCESS_USERNAME) == "expired_access"
+    assert keyring.get_password(ts.KEYRING_SERVICE, ts.KEYRING_REFRESH_USERNAME) == "valid_refresh"
+
+
+def test_persist_refresh_keyring_failure_falls_back_to_file(tmp_path, monkeypatch):
+    """If refresh_token keyring write fails but access succeeds, fall back to file."""
+    store, keyring = setup_store(tmp_path, monkeypatch)
+
+    # Access succeeds but refresh write will fail
+    original_set = keyring.set_password
+    call_count = [0]
+
+    def flaky_set(service, username, password):
+        call_count[0] += 1
+        if username == ts.KEYRING_REFRESH_USERNAME:
+            raise RuntimeError("Keyring hiccup on second write")
+        original_set(service, username, password)
+
+    monkeypatch.setattr(keyring, "set_password", flaky_set)
+
+    store.save("access_tok", "refresh_tok")
+
+    # File should exist with BOTH tokens (fallback for both)
+    data = json.loads(store.token_file.read_text())
+    assert data["access_token"] == "access_tok"
+    assert data["refresh_token"] == "refresh_tok"
+    # In-memory state should be correct
+    assert store.access_token == "access_tok"
+    assert store.refresh_token == "refresh_tok"
+
+
 def _setup_interactive_test(tmp_path, monkeypatch, user_input="y"):
     """Helper to setup interactive clearing tests."""
     keyring = FakeKeyring()

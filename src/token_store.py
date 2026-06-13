@@ -13,6 +13,16 @@ import keyring
 
 logger = logging.getLogger(__name__)
 
+
+class TransientRefreshError(Exception):
+    """Raised when token refresh fails due to a transient (non-auth) error.
+
+    Callers should preserve stored credentials when this is raised, as the
+    refresh token is likely still valid and will work once the transient
+    condition (network outage, server error) resolves.
+    """
+
+
 # Constants for token storage
 MCP_SERVER_DIR_NAME = ".mcp-server-dash"
 TOKEN_FILENAME = "dropbox_token.json"
@@ -146,7 +156,13 @@ class DropboxTokenStore:
 
             # Try refresh token
             if refresh_token:
-                new_access = self._do_refresh(refresh_token)
+                try:
+                    new_access = self._do_refresh(refresh_token)
+                except TransientRefreshError as e:
+                    # Network/server error — preserve credentials for retry
+                    logger.warning("Transient refresh error, credentials preserved: %s", e)
+                    return False
+
                 if new_access:
                     self.access_token = new_access
                     self.refresh_token = refresh_token
@@ -170,8 +186,10 @@ class DropboxTokenStore:
     def _do_refresh(self, refresh_token: str) -> str | None:
         """Exchange a refresh token for a new access token via the Dropbox API.
 
-        Returns the new access token, or None if refresh fails.
-        Uses a direct HTTP call (no private SDK attributes).
+        Returns the new access token on success.
+        Returns None for definitive auth failures (e.g. ``invalid_grant``).
+        Raises TransientRefreshError for network/server errors that may resolve
+        on retry (callers should preserve credentials in that case).
         """
         import os
 
@@ -179,6 +197,7 @@ class DropboxTokenStore:
         if not app_key:
             logger.error("APP_KEY not set, cannot refresh token")
             return None
+
         try:
             with httpx.Client(timeout=30) as client:
                 resp = client.post(
@@ -189,25 +208,40 @@ class DropboxTokenStore:
                         "client_id": app_key,
                     },
                 )
-            if resp.status_code != 200:
-                error_data = resp.json() if resp.text else {}
-                logger.warning("Token refresh failed: %s", error_data.get("error_description", resp.text))
-                return None
-            token_data = resp.json()
-            return token_data.get("access_token")
-        except Exception as e:
-            logger.warning("Token refresh request failed: %s", e)
+        except httpx.TransportError as e:
+            raise TransientRefreshError(f"Network error during token refresh: {e}") from e
+
+        # 5xx — server error, may be transient
+        if resp.status_code >= 500:
+            raise TransientRefreshError(
+                f"Dropbox server error {resp.status_code} during token refresh"
+            )
+
+        if resp.status_code != 200:
+            error_data = resp.json() if resp.text else {}
+            logger.warning(
+                "Token refresh failed: %s",
+                error_data.get("error_description", resp.text),
+            )
             return None
+
+        token_data = resp.json()
+        return token_data.get("access_token")
 
     def try_refresh(self) -> bool:
         """Attempt a refresh using the stored refresh token.
 
         Called at runtime when an API call returns 401. Returns True on success.
-        Does NOT clear credentials on failure — the caller decides.
+        Returns False on failure (including transient errors) — never raises.
+        Does NOT clear credentials — the caller decides.
         """
         if not self.refresh_token:
             return False
-        new_access = self._do_refresh(self.refresh_token)
+        try:
+            new_access = self._do_refresh(self.refresh_token)
+        except TransientRefreshError as e:
+            logger.warning("Transient refresh error at runtime: %s", e)
+            return False
         if new_access:
             self.access_token = new_access
             self.dbx = dropbox.Dropbox(new_access)
@@ -232,26 +266,30 @@ class DropboxTokenStore:
     def _persist(self, access_token: str, refresh_token: str | None) -> None:
         """Persist both tokens to keyring (preferred) and file (fallback).
 
-        Tries keyring first for both tokens. If keyring is available, no
-        plaintext file is written. If keyring fails, falls back to file.
-        Raises RuntimeError if both backends fail.
+        Treats access + refresh token persistence as a transaction: both must
+        land in keyring, or neither does (fall back to file for both).
+        Raises RuntimeError if both keyring and file storage fail.
         """
-        keyring_ok = True
+        access_ok = False
         try:
             keyring.set_password(KEYRING_SERVICE, KEYRING_ACCESS_USERNAME, access_token)
+            access_ok = True
         except Exception:
-            keyring_ok = False
+            pass
 
-        if refresh_token and keyring_ok:
-            with suppress(Exception):
+        refresh_ok = True
+        if refresh_token and access_ok:
+            try:
                 keyring.set_password(KEYRING_SERVICE, KEYRING_REFRESH_USERNAME, refresh_token)
+            except Exception:
+                refresh_ok = False
 
-        if keyring_ok:
+        if access_ok and refresh_ok:
             logger.debug("Tokens saved to keyring successfully")
             return
 
-        # Keyring failed — fall back to file
-        logger.warning("Keyring unavailable, falling back to file storage")
+        # Keyring partially or fully failed — fall back to file for BOTH tokens
+        logger.warning("Keyring partially or fully unavailable, falling back to file storage")
         self._save_to_file(access_token, refresh_token)
 
     def save(self, token: str, refresh_token: str | None = None) -> None:
