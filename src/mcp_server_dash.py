@@ -229,7 +229,7 @@ async def dash_authenticate(auth_code: str) -> str:
         account = dbx.users_get_current_account()
 
         try:
-            token_store.save(access_token)
+            token_store.save(access_token, token_data.get("refresh_token"))
         except Exception as e:
             logger.error(f"Failed to save token: {e}")
             return (
