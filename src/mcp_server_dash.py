@@ -17,6 +17,7 @@ from typing import Any, Literal
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 from auth_pkce import PKCEAuthFlow
 from dash_api import (
@@ -133,8 +134,26 @@ _args = (
     )
 )
 
-# Initialize fastmcp app with appropriate host/port for server mode
-mcp = FastMCP("dash-mcp", host=_args.host, port=_args.port)
+# Initialize fastmcp app with appropriate host/port for server mode.
+# DNS rebinding protection: only accept requests whose Host header is loopback
+# on the configured port. A rebound DNS name (e.g. *.attacker.tld) resolving to
+# 127.0.0.1 will be rejected because the Host header carries the attacker
+# hostname, not localhost. Origin is left unrestricted so legitimate same-origin
+# MCP clients still work; the Host check alone breaks the rebinding path.
+_allowed_hosts = [
+    f"127.0.0.1:{_args.port}",
+    f"localhost:{_args.port}",
+    f"[::1]:{_args.port}",
+]
+mcp = FastMCP(
+    "dash-mcp",
+    host=_args.host,
+    port=_args.port,
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=_allowed_hosts,
+    ),
+)
 
 
 @mcp.tool()
