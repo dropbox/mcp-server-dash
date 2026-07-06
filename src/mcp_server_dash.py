@@ -248,7 +248,7 @@ async def dash_authenticate(auth_code: str) -> str:
         account = dbx.users_get_current_account()
 
         try:
-            token_store.save(access_token)
+            token_store.save(access_token, token_data.get("refresh_token"))
         except Exception as e:
             logger.error(f"Failed to save token: {e}")
             return (
@@ -357,12 +357,16 @@ async def dash_company_search(
         try:
             resp = await api.search(req)
         except PermissionError:
-            # Likely invalid/expired token
-            token_store.clear()
-            return (
-                "Authorization failed (token invalid or expired). Please re-authenticate: "
-                "call dash_get_auth_url and then dash_authenticate with the new code."
-            )
+            # Token may be expired — try refresh before giving up
+            if token_store.try_refresh():
+                api = DashAPI(token_store.access_token or "")
+                resp = await api.search(req)
+            else:
+                token_store.clear()
+                return (
+                    "Authorization failed (token invalid or expired). Please re-authenticate: "
+                    "call dash_get_auth_url and then dash_authenticate with the new code."
+                )
         if not resp.results:
             return f"Found 0 results for '{query}':\n\n"  # stable result count line
         return _format_search_response(resp, query)
@@ -404,11 +408,15 @@ async def dash_get_file_details(uuid: str) -> str:
         try:
             resp = await api.get_link_metadata(req)
         except PermissionError:
-            token_store.clear()
-            return (
-                "Authorization failed (token invalid or expired). Please re-authenticate: "
-                "call dash_get_auth_url and then dash_authenticate with the new code."
-            )
+            if token_store.try_refresh():
+                api = DashAPI(token_store.access_token or "")
+                resp = await api.get_link_metadata(req)
+            else:
+                token_store.clear()
+                return (
+                    "Authorization failed (token invalid or expired). Please re-authenticate: "
+                    "call dash_get_auth_url and then dash_authenticate with the new code."
+                )
         if not resp.results:
             return f"No file found with UUID: {uuid}"
         return _format_file_details_response(resp, uuid)
